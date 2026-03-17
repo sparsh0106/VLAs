@@ -1,10 +1,5 @@
-# X-RT1 Ablation Study — Full Technical Report
 ### Vision-Language-Action Models for Robot Cable Routing: A Six-Notebook Ablation Study
 
-> **Authors:** [Your Name(s) — fill in]
-> **Group / Lab:** [Fill in]
-> **Course / Supervisor:** [Fill in]
-> **Date:** [Fill in]
 
 ---
 
@@ -1519,3 +1514,571 @@ All notebooks require:
 MARKDOWN_EOF
 echo "Done. Line count:"
 wc -l /mnt/user-data/outputs/X_RT1_Ablation_Study_Technical_Report.md
+---
+
+---
+
+# Production RT-1 Notebook — `production_rt1_notebook-Copy1.ipynb`
+## Second Dataset Experiment: DROID + Custom XAI Implementation
+
+---
+
+## Overview and Context
+
+This notebook represents the **second training experiment** in the overall project. While notebooks nb1–nb6 all train on the `berkeley_cable_routing` dataset (downloaded from Google Cloud Storage via TFDS), this production notebook trains the **same RT-1 architecture** — MaxViT-Base + DistilBERT + CrossAttn TokenLearner — on a **completely different dataset: DROID**, stored locally as a compressed NumPy file (`droid_train_100.npz`).
+
+The goals of this notebook are twofold:
+1. **Cross-dataset validation:** Test whether the RT-1 architecture generalises to a different robotics dataset with different action spaces, different camera setups, and different task distributions.
+2. **Production-grade XAI pipeline:** Replace the external `pytorch-grad-cam` library used in nb1–nb6 with fully custom, self-contained CAM implementations that are directly wired into the model via PyTorch forward/backward hooks. This enables two novel XAI hybrid methods not possible with the external library.
+
+The notebook is structured into 13 sections (vs. the 21-block system in nb1–nb6), with a separate training-resume cell for recovering from disconnections.
+
+---
+
+## Section 1: Configuration
+
+The configuration block (`NPZ_PATH = "droid_train_100.npz"`) sets the most important distinction from nb1–nb6 immediately: the data source is a local `.npz` file, not a GCS-hosted TFDS dataset.
+
+### Configuration Variables — Full Explanation
+
+| Variable | Value | Plain-English Meaning | Why this value? |
+|---|---|---|---|
+| `NPZ_PATH` | `"droid_train_100.npz"` | Path to the DROID dataset file in NumPy compressed format | DROID is pre-packaged as NPZ; the `100` suffix indicates 100 episodes from the full DROID dataset |
+| `DEVICE` | `"cuda"` | Run all model computations on the GPU | GPU is 10–100× faster than CPU for matrix multiplications |
+| `VIT_DIM` | `40` | Base channel width of MaxViT backbone | Same as nb1; determines `embed_dim = 40 × 2³ = 320` |
+| `VIT_DEPTH` | `(4, 4, 3)` | Number of MBConv blocks per stage | Same as nb1; 11 blocks total |
+| `TRANSFORMER_DEPTH` | `6` | Number of transformer encoder layers | Same as nb1 |
+| `TRANSFORMER_HEADS` | `8` | Number of attention heads per transformer layer | Same as nb1 |
+| `DROPOUT` | `0.2` | Dropout probability in transformer and projection layers | Standard regularisation for mid-size transformers |
+| `NUM_VISUAL_TOKENS` | `32` | Number of tokens produced by the TokenLearner | Same as nb1; compresses 784 spatial positions to 32 |
+| `USE_FUSED_MBCONV` | `True` | Use fused (3×3 conv + SE + 1×1 conv) instead of depthwise | Faster on Ampere/H100 GPUs |
+| `DROP_PATH_RATE` | `0.2` | Stochastic depth rate for MBConv blocks | Same as nb1 |
+| `BATCH_SIZE` | `15` | Number of samples per micro-batch | **Much larger than nb1's `BATCH_SIZE=1`** — possible because DROID NPZ loads faster than TFDS streaming |
+| `GRADIENT_ACCUM_STEPS` | `2` | Accumulate gradients over this many batches before stepping | Effective batch = 15 × 2 = **30**. Much smaller effective batch than nb1–nb6's 128, because DROID has more varied tasks making smaller batches sufficient |
+| `EPOCHS` | `80` | Maximum training epochs | Same as nb1–nb6 |
+| `WARMUP_STEPS` | `500` | Linear LR warmup steps | Same as nb1 |
+| `LR` | `3e-5` | Lion peak learning rate | Same as nb1 |
+| `WEIGHT_DECAY` | `0.15` | Decoupled L2 penalty | Same as nb1 |
+| `LION_BETAS` | `(0.9, 0.99)` | Momentum decay coefficients for Lion | Same as nb1 |
+| `GRAD_CLIP` | `1.0` | Maximum gradient L2 norm | Same as nb1 |
+| `LABEL_SMOOTHING` | `0.1` | Focal loss label smoothing ε | Same as nb1 |
+| `MIXUP_ALPHA` | `0.3` | Beta distribution parameter for MixUp/CutMix | Same as nb1 |
+| `USE_CUTMIX` | `True` | Enable CutMix augmentation | Same as nb1 |
+| `FOCAL_GAMMA` | `2.5` | Focal loss focusing parameter γ | Same as nb1 |
+| `SEQ_LEN` | `6` | Number of consecutive frames per training sample | Same as nb1 |
+| `TARGET_SIZE` | `224` | Resize every image to 224×224 pixels | Same as nb1 |
+| `SPLIT_RATIO` | `0.8` | 80% train / 20% val split | Same as nb1 |
+| `NUM_WORKERS` | `2` | DataLoader worker processes | Same as nb1 |
+| `PREFETCH_FACTOR` | `4` | Batches prefetched per worker | Same as nb1 |
+| `PATIENCE` | `10` | Early stopping patience in epochs | Same as nb1 |
+| `CHECKPOINT_FREQ` | `5` | Save a periodic checkpoint every 5 epochs | Provides recovery points; `rt1_checkpoint_epoch_20.pt` was created by this setting |
+| `TASK_METRIC_FREQ` | `5` | Compute per-task loss breakdown every N batches | Every 5 batches is a balance — frequent enough to catch per-task failures, infrequent enough not to add overhead to every batch |
+| `USE_BFLOAT16` | `True` | Enable BFloat16 automatic mixed precision | Same rationale as nb1 |
+| `XAI_NUM_SAMPLES` | `8` | Number of validation samples to run through the XAI suite | 8 is enough for visual comparison without excessive compute time |
+| `XAI_LIME_PERTURBATIONS` | `500` | Number of perturbed images LIME generates per explanation | Higher than nb1–nb6's 128; provides more accurate local linear approximation at the cost of ~4× more forward passes |
+| `XAI_SHAP_BACKGROUND` | `20` | Number of background samples for DeepSHAP estimation | 20 gives stable Shapley value estimates without excessive memory |
+| `XAI_PDP_GRID_SIZE` | `15` | Number of grid points in PDP sweeps | 15 points give a smooth enough curve for visual interpretation |
+| `XAI_ICE_SAMPLES` | `30` | Number of individual samples for ICE plots | 30 curves reveal per-sample heterogeneity clearly |
+
+**Key configuration differences vs. nb1–nb6:**
+
+| Property | nb1–nb6 (Cable Routing) | Production (DROID) |
+|---|---|---|
+| Dataset format | TFDS / GCS download | Local `.npz` file |
+| BATCH_SIZE | 1 | 15 |
+| GRADIENT_ACCUM_STEPS | 128 | 2 |
+| Effective batch size | 128 | 30 |
+| XAI library | `pytorch-grad-cam` (external) | Fully custom (built-in hooks) |
+| LIME perturbations | 128 | 500 |
+| Checkpointing | Every epoch (best only) | Every 5 epochs + best |
+
+**Why `BATCH_SIZE=15` with `GRADIENT_ACCUM_STEPS=2` instead of `BATCH_SIZE=1` with `GRADIENT_ACCUM_STEPS=128`?**
+DROID data is stored as a pre-processed NumPy `.npz` file, which loads into RAM in one shot and allows random-access indexing with negligible I/O overhead. This means larger batch sizes are feasible without I/O bottlenecks. The TFDS-based berkeley_cable_routing dataset required `BATCH_SIZE=1` because streaming TFRecord shards introduced I/O latency that made larger batches wasteful. The effective batch of 30 (vs. 128 in nb1) is appropriate for DROID's more diverse task distribution, where each batch naturally contains a wider variety of instructions.
+
+---
+
+## Section 2: Core Utilities
+
+Identical to nb1–nb6: `RT1Tokenizer` (vocab_size=256, range [-3.2, +3.2]) and `DropPath` (Stochastic Depth). See §5.4 of the main report for full explanation.
+
+---
+
+## Section 3: Text Encoder — `DistilBERTEncoder`
+
+Identical class definition to nb1. Frozen DistilBERT-base-uncased, outputs CLS token embedding of shape `(B, 768)`. See §10 (Notebook 1) of the main report for full explanation.
+
+---
+
+## Section 4: Vision Encoder — `AdvancedMaxViT` (EfficientNet-V2 Style)
+
+The vision backbone is `AdvancedMaxViT` with the same parameters as nb1 (`dim=40, depth=(4,4,3)`), but the class is re-implemented here using simpler naming (`MBConv` instead of `ImprovedMBConv`, `SqueezeExcitation` instead of `ImprovedSqueezeExcitation`). Functionally they are identical.
+
+**Why "Improved" prefix in nb1–nb6 but plain names here?**
+In nb1–nb6, the "Improved" prefix signals that these are modified versions of the standard published components:
+- `ImprovedSqueezeExcitation` adds `BatchNorm1d` after the squeeze layer and `Dropout(0.1)` in the excitation path — the standard SE [SE] has neither.
+- `ImprovedMBConv` adds configurable stochastic depth via `DropPath` — standard MBConv [EfficientNet] does not include this.
+- `ImprovedTemporalConv` is an entirely new component with no standard prior; the "Improved" prefix distinguishes it from simpler temporal convolutions.
+
+In this production notebook, the same improvements are present (BatchNorm1d, Dropout in SE; DropPath in MBConv), but the "Improved" naming convention was dropped for conciseness in the production codebase. The behaviour is equivalent.
+
+**Architecture shape flow (same as nb1):**
+```
+Input:   (B×F, 3, 224, 224)
+Stem:    Conv(3→40, 3×3, stride=2) + BN + SiLU
+         Conv(40→40, 3×3, stride=1) + BN + SiLU
+         → (B×F, 40, 112, 112)
+
+Stage 0: 4× MBConv(fused, no downsample)  → (B×F,  40, 112, 112)
+Stage 1: 1× MBConv(fused, downsample)     → (B×F,  80,  56,  56)
+         3× MBConv(fused, no downsample)  → (B×F,  80,  56,  56)
+Stage 2: 1× MBConv(std, downsample)       → (B×F, 160,  28,  28)
+         2× MBConv(std, no downsample)    → (B×F, 160,  28,  28)
+
+Output:  (B×F, 160, 28, 28)    embed_dim = 160
+```
+
+> **Note:** In this notebook, `embed_dim=160` (not 320 as stated in nb1's architecture flow above). This is because stage 2 uses `expansion=4` (non-fused), which does not double the channel dimension in the same way. The actual embed_dim depends on the stage transition logic in `AdvancedMaxViT.__init__`: `dim_out = curr_dim * 2 if ds else curr_dim`, and the third stage starts with `curr_dim=80` when entering the downsampling block.
+
+---
+
+## Section 5: Token Learner and Temporal Convolution
+
+Identical implementations to nb1. `AdvancedTokenLearner` uses cross-attention with 32 learnable query vectors and a position embedding that is bilinearly interpolated to match the spatial size of the feature map. `TemporalConv` (equivalent to `ImprovedTemporalConv` in nb1–nb6) uses a depthwise 3D conv over the time axis followed by a 3D SE-like gating mechanism.
+
+---
+
+## Section 6: `ProductionRT1` — Model with Built-in XAI Hook Infrastructure
+
+This is the **most important architectural difference** from nb1–nb6. Rather than wrapping an existing model with an external CAM library, `ProductionRT1` has XAI hooks built directly into its class definition.
+
+### What are PyTorch hooks?
+
+A **hook** in PyTorch is a callback function that is registered to execute at a specific point in the forward or backward pass. Forward hooks capture the output of a layer during inference. Backward hooks capture the gradient flowing back through a layer during backpropagation (the process of computing how much each weight contributed to the error). These captured values are exactly what all CAM-based XAI methods need.
+
+### Hook Infrastructure Design
+
+```python
+# Three dictionaries for XAI state
+self._activations = {}   # name → output tensor from forward pass
+self._gradients   = {}   # name → gradient tensor from backward pass
+self._hooks       = []   # list of registered hook handles (for cleanup)
+```
+
+**`register_xai_hooks(target_layers=None)`** registers both forward and backward hooks on each specified layer. The default targets are the three ViT stages:
+```python
+'vit_stage_0': self.vit.stages[0]   # shallowest, highest resolution (112×112)
+'vit_stage_1': self.vit.stages[1]   # mid, 56×56
+'vit_stage_2': self.vit.stages[2]   # deepest, lowest resolution (28×28) ← default for CAM
+```
+
+**Forward hook** `_fwd_hook(name)`: Captures the output tensor of the stage (detached from the computation graph to avoid accidental gradient accumulation in the stored activation).
+
+**Backward hook** `_bwd_hook(name)`: Captures the gradient tensor flowing back through the stage. Uses `register_full_backward_hook` (the modern API that correctly handles all output types, including tuples).
+
+**`remove_xai_hooks()`**: Removes all registered hooks and clears the dictionaries. Always called after each XAI computation to prevent memory leaks and stale gradient accumulation.
+
+### `forward_for_xai(video, text_embeddings, target_action_idx=0)`
+
+This is a second forward method alongside the standard `forward()`. It performs the same computation but additionally computes a **differentiable scalar score** that can be passed to `.backward()`:
+
+```python
+logits = self.forward(video, text_embeddings)           # shape: (B, 7, 256)
+pred_tokens = logits[:, target_action_idx, :].argmax()  # predicted bin index
+scores = logits[:, target_action_idx, pred_tokens]      # probability of predicted bin
+return scores, logits
+```
+
+**Why not just use `logits.sum().backward()`?** Calling backward on the full logit tensor computes gradients with respect to all 7×256 = 1792 output values, producing mixed gradients that average out task-specific information. By selecting only the predicted bin of the target action dimension (`target_action_idx=0` = first action = wx translational velocity), we obtain gradients that are specific to the model's most confident action prediction, producing sharper and more interpretable CAM maps.
+
+---
+
+## Section 7: Training Utilities
+
+### `FocalLoss` — Same as nb1–nb6 but without temperature scaling
+
+The production notebook uses a simplified `FocalLoss` that drops the `temperature` parameter present in nb1–nb6. Functionally equivalent for `temperature=1.0`. See §6.1 of the main report for full derivation.
+
+### `MixupCutMix` — Same algorithm, different class name
+
+Renamed from `ImprovedMixup` in nb1–nb6. Identical algorithm. See §6.2 of the main report.
+
+### `Lion` — Same implementation
+
+See §6.3 of the main report.
+
+### `CosineWarmupScheduler` — Same as `ImprovedScheduler` in nb1–nb6
+
+Different class name, identical behaviour: linear warmup for `warmup_steps` steps, then cosine annealing to `min_lr_ratio × base_lr`. See §6.4 of the main report.
+
+### `ModelEMA` — Explicit `apply_shadow()` / `restore()` API
+
+The production notebook's `ModelEMA` adds two methods that nb1–nb6's version lacks:
+
+**`apply_shadow(model)`:** Copies the EMA weights into the model's parameters (backing up the current weights first). Called before validation so the EMA model is evaluated rather than the last-batch model.
+
+**`restore(model)`:** Copies the backed-up weights back into the model. Called after validation so training resumes from the live (non-EMA) weights.
+
+This pattern — apply EMA before validation, restore after — is the correct way to use EMA in a training loop. In nb1–nb6, only the shadow weights are saved to disk; in this notebook, EMA is also used for the validation pass itself.
+
+### `PerTaskMetrics` — Batch-level updates
+
+Updated from nb1–nb6 to use `update_batch(loss_per_sample, task_ids)` which processes an entire batch at once, rather than sample-by-sample. This is more efficient because `loss_per_sample` is computed from existing logits (no extra forward pass) via:
+
+```python
+per_sample = F.cross_entropy(logits_flat, target_flat, reduction='none')
+             .view(-1, 7).mean(dim=1)   # average over 7 action dimensions
+```
+
+The `print_worst(dataset, k=5)` method prints the 5 task instructions with the highest average loss, directly identifying which cable routing or DROID subtasks the model struggles with most.
+
+### `ValidationTracker` — New class replacing simple patience counter
+
+`ValidationTracker` is a new utility class that does everything the simple `patience_counter` variable did in nb1–nb6, but adds comprehensive history tracking and trend analysis.
+
+```python
+class ValidationTracker:
+    def __init__(self, patience=10):
+        self.history = {
+            'train_loss': [], 'val_loss': [], 'val_acc': [],
+            'val_mae': [], 'lr': [], 'throughput': [],
+            'train_acc': [], 'improvement': []
+        }
+```
+
+**Key additions over simple patience counter:**
+
+| Feature | Simple counter (nb1–nb6) | `ValidationTracker` |
+|---|---|---|
+| Best loss tracking | `best_val_loss = float('inf')` | Same, plus `best_epoch`, `best_val_acc` |
+| History | `history` dict updated manually | Encapsulated in `update()` method |
+| Trend analysis | Not present | 5-epoch linear regression trend: `np.polyfit(range(5), val_losses[-5:], 1)` |
+| Reporting | `tqdm` postfix only | `print_status(epoch)` prints full summary table |
+| Early stopping | `if patience_counter >= PATIENCE` | `tracker.should_stop` property |
+| Improvement delta | Not tracked | `history['improvement']` stores per-epoch delta |
+
+**Why track the 5-epoch trend?** A model can have a low patience counter but still be on a worsening trend. For example, if validation loss was 2.0, 1.9, 1.95, 1.93, 1.94 over 5 epochs, the patience counter is 3 (no improvement for 3 epochs) but the trend is flat — not clearly worsening. The linear fit gives a slope in "loss per epoch" units, which the trainer can use to decide whether to reduce the LR or continue.
+
+---
+
+## Section 8: Dataset — `AdvancedDroidDataset`
+
+### What is DROID?
+
+DROID (Diverse Robot Operation and Instruction Dataset) is a large-scale real-robot manipulation dataset collected across many laboratory environments using diverse manipulation tasks. Unlike `berkeley_cable_routing` which focuses on a single task type, DROID contains hundreds of distinct manipulation skills with rich natural language instructions. The `droid_train_100.npz` file used here is a **100-episode subset** of the full DROID dataset, pre-processed and saved as a NumPy compressed archive.
+
+**Why NPZ format instead of TFDS?**
+The DROID data was pre-processed (images resized, actions standardised) and packaged as a single `.npz` file for portability. This avoids the TFDS/GCS infrastructure required for `berkeley_cable_routing` and eliminates the TF/PyTorch GPU memory conflict problem entirely — there is no TensorFlow involved in this notebook.
+
+### NPZ File Structure
+
+```python
+data = np.load('droid_train_100.npz', allow_pickle=True)
+data['images']        # shape (N, H, W, 3), dtype uint8 — all frames
+data['actions']       # shape (N, action_dim), dtype float32 — action vectors
+data['instructions']  # shape (N,), dtype object — instruction strings
+```
+
+All frames are stored contiguously. Episode boundaries are implicit: they are not stored in the NPZ file. Instead, `AdvancedDroidDataset` treats all frames as a flat sequence and uses the `seq_len` lookback window to construct clips. This is simpler than `CableRoutingDataset`'s explicit `episode_bounds` system, at the cost of potentially creating clips that span episode boundaries (which the code does not prevent).
+
+### Adaptive Augmentation — Strong vs. Weak
+
+The production dataset introduces an important innovation absent from nb1–nb6: **adaptive augmentation based on task frequency**. In `__getitem__`:
+
+```python
+if self.mode == "train":
+    transform = (self.strong_aug if self.task_counts[tid] < 500
+                 else self.weak_aug)
+```
+
+**Strong augmentation** (for tasks with fewer than 500 samples):
+```
+ToPILImage()
+RandomApply([ColorJitter(0.4, 0.4, 0.4, 0.2)], p=0.8)   # aggressive colour jitter
+RandomResizedCrop(224, scale=(0.7, 1.0))                   # wider crop range (70–100%)
+RandomApply([GaussianBlur(5, sigma=(0.1, 2.5))], p=0.5)   # optional blur
+ToTensor()
+RandomErasing(p=0.3)                                        # random rectangular masking
+```
+
+**Weak augmentation** (for tasks with 500+ samples):
+```
+ToPILImage()
+RandomResizedCrop(224, scale=(0.85, 1.0))  # gentler crop range
+ToTensor()
+```
+
+**Why adaptive augmentation?** DROID has highly imbalanced task distributions — some manipulation skills have thousands of demonstrations while others have only tens. For rare tasks, strong augmentation artificially multiplies the effective number of training examples the model sees, preventing rare-task features from being "forgotten" due to infrequent updates. For common tasks, aggressive augmentation would introduce unnecessary noise and potentially harm performance on the tasks the model has already learned well.
+
+**Two new augmentations not in nb1–nb6:**
+- **`GaussianBlur(5, sigma=(0.1, 2.5))`:** Adds slight blurring with 50% probability. Simulates camera defocus and motion blur, which are common in real robot recordings. Kernel size 5 is large enough to meaningfully blur the image without destroying all fine structure.
+- **`RandomErasing(p=0.3)`:** With 30% probability, randomly masks a rectangular region of the image with zeros (black). This forces the model to rely on partial views and prevents over-reliance on any single region of the image — particularly valuable for DROID where task-relevant objects can appear anywhere in the frame.
+
+---
+
+## Section 9: XAI Methods — Custom Built-in Implementations
+
+This is the most significant departure from nb1–nb6. Instead of using the external `pytorch-grad-cam` package, all XAI methods are implemented from scratch and use the hook infrastructure built into `ProductionRT1`.
+
+### `BaseCAM` — Foundation for All CAM Methods
+
+```python
+class BaseCAM:
+    def __init__(self, model, text_encoder, target_layer_name='vit_stage_2'):
+```
+
+`BaseCAM` provides two shared utilities:
+
+**`_get_act_grad(video, text_emb, target_action_idx)`:** Registers hooks, performs a forward pass via `forward_for_xai`, calls `.backward()` to compute gradients, retrieves the stored activation and gradient tensors from `_activations` and `_gradients`, removes hooks, and returns `(activation, gradient, logits, input_tensor)`.
+
+**`_normalize(cam)`:** Maps a CAM tensor to `[0, 1]` per sample in the batch by subtracting the minimum and dividing by the range. Handles both 2D (H, W) and 3D (B, H, W) inputs.
+
+**Why a base class?** All five CAM methods share the hook registration/cleanup pattern and the normalisation step. Factoring this into `BaseCAM` prevents code duplication and ensures that hook cleanup is never accidentally omitted (which would cause memory leaks).
+
+### `HiResCAM` — Provably Faithful Attribution [HiResCAM]
+
+```python
+cam = (act * grad).sum(dim=1)   # element-wise product, sum over channels
+cam = F.relu(cam)               # keep only positive activations
+```
+
+HiResCAM (Draelos & Carin, 2020) [HiResCAM] computes the element-wise product of the activation map and the gradient map **before** summing over channels. Standard GradCAM averages the gradient over spatial dimensions first (`weight_c = (1/HW) Σ_{h,w} grad_{c,h,w}`) and then takes a weighted sum of activations (`Σ_c weight_c × act_c`). This spatial averaging loses spatial precision. HiResCAM's per-position, per-channel multiplication preserves full spatial resolution and is **provably faithful** — the resulting heatmap is a valid first-order Taylor expansion of the model's output with respect to the input activations.
+
+**Why target `vit_stage_2` (the deepest stage) by default?** The deepest feature maps have the highest semantic abstraction — they encode "what" the model is looking at (cable, clip, gripper) rather than low-level edges or textures. For task-level action prediction, semantic attribution is more informative than texture attribution.
+
+### `ShapleyCAM` — Game-Theoretic Second-Order Attribution [ShapleyCAM]
+
+```python
+# Gradient (first-order term)
+act = model._activations['vit_stage_2']
+grad = model._gradients['vit_stage_2']
+
+# Hessian-vector product (second-order term, approximated)
+for c in range(min(max_hvp_channels, grad.shape[1])):
+    cg = grad[:, c].sum()
+    h = torch.autograd.grad(cg, v, retain_graph=True)[0]
+    hvp[:, c] = h.mean(dim=(1,2,3)).expand_as(grad[:, c])
+
+shapley_weight = grad + 0.5 * hvp    # second-order Taylor coefficient
+cam = (act * shapley_weight).sum(dim=1)
+```
+
+ShapleyCAM approximates the Shapley value of each spatial location by computing a second-order Taylor expansion of the model's output. The first-order term is the gradient; the second-order term is the Hessian-vector product (HVP), which captures how the gradient itself changes as the input changes. The coefficient `0.5` comes from the second-order Taylor series `f(x) ≈ f(0) + f'(0)x + 0.5f''(0)x²`.
+
+**Why limit to `max_hvp_channels=16`?** Computing the full HVP requires one backward pass through the computation graph per channel. With 160 channels, this would be 160 backward passes — prohibitively slow. Limiting to 16 channels reduces the HVP computation to 16 backward passes while still capturing the dominant second-order directions (the channels with the highest gradient magnitudes typically carry the most information).
+
+### `LayerCAM` — Multi-Scale Attribution [LayerCAM]
+
+```python
+pos_grad = F.relu(grad)              # only positive gradients (what helps the prediction)
+cam = (act * pos_grad).sum(dim=1)    # spatially weight activations by positive gradients
+cam = F.relu(cam)
+```
+
+LayerCAM (Jiang et al., 2021) uses only the **positive** gradient components. The intuition is that negative gradients indicate features that hurt the model's prediction — including these in the attribution would cancel out positive contributions and produce noisy maps. By filtering to positive gradients, LayerCAM produces cleaner, more focused attribution maps.
+
+LayerCAM also runs on **all three stages** simultaneously and combines them:
+```
+stage_0 features: 112×112, local texture details
+stage_1 features: 56×56, mid-level shapes
+stage_2 features: 28×28, semantic scene structure
+```
+The three CAMs are upsampled to a common resolution and summed, producing a multi-scale attribution that captures both fine-grained details (from stage_0) and semantic regions (from stage_2).
+
+---
+
+## Novel XAI Hybrid 1 — `HiResShapleyCAM`
+
+**Full name:** HiResCAM modulated by Shapley-derived spatial attention.
+
+**Motivation:** HiResCAM is provably faithful but does not distinguish which spatial regions are the most *important* in a game-theoretic sense — it only knows which regions are in the gradient path. ShapleyCAM gives importance scores but at the cost of spatial precision. HiResShapleyCAM combines both:
+
+```
+Step 1: hires = ReLU(Σ_c A_c ⊙ G_c)          # HiResCAM: faithful element-wise map
+Step 2: shapley_score = (G + 0.5 × HVP).sum(c) # Shapley importance per location
+Step 3: attn = softmax(shapley_score / τ)        # convert to spatial attention (τ=2.0)
+Step 4: fused = ReLU(hires ⊙ attn)              # modulate faithful map by importance
+```
+
+**Why softmax with temperature `τ=2.0`?** Raw Shapley scores can have very large differences between spatial locations. A temperature of 2.0 "softens" the softmax distribution — instead of concentrating almost all weight on one location (which would happen at low temperature), it distributes weight more broadly while still respecting the importance ranking. This prevents the fusion from collapsing to a single point.
+
+**What this buys:** The resulting map highlights regions that are simultaneously (a) in the gradient path from the prediction back to the feature map (HiResCAM's faithfulness guarantee) AND (b) have high importance under a second-order game-theoretic scoring (ShapleyCAM's theoretical grounding). Neither method alone provides both properties.
+
+---
+
+## Novel XAI Hybrid 2 — `MultiScaleLayerShapleyCAM`
+
+**Full name:** LayerCAM at multiple scales with Shapley-weighted layer combination.
+
+**Motivation:** Standard LayerCAM sums the CAMs from all stages with equal weight. But different stages contribute differently to different tasks — for a task requiring precise spatial localisation (e.g., picking up a small cable end), shallow stages (112×112 resolution) are more informative. For a task requiring understanding the full scene layout, deep stages (28×28) are more informative. This method uses each layer's Shapley importance to determine how much weight to give it.
+
+```
+For each stage l ∈ {0, 1, 2}:
+  cam_l = ReLU(Σ_c A_c ⊙ ReLU(G_c))        # LayerCAM at this scale
+
+  grad_magnitude = |G_l|.mean()              # how strong are the gradients here?
+  curvature = |∂grad_magnitude/∂input|.mean()  # how much do gradients change?
+  importance_l = grad_magnitude + 0.5 × curvature  # Shapley-weighted importance
+
+w = softmax([importance_0, importance_1, importance_2])  # layer weights
+
+Resize all cam_l to the resolution of cam_2 (28×28)
+Final = Σ_l w_l × cam_l
+```
+
+**Why use curvature to measure importance?** A layer with high gradient magnitude is clearly active, but a layer with high curvature (the gradient changes a lot as the input changes) is in a region of the loss landscape that is highly sensitive. This second-order signal identifies layers whose activations are not just large but also non-linear — precisely the layers that contain the most task-discriminative information.
+
+---
+
+## `LIMEExplainer` — Custom Implementation, No External Dependencies
+
+Unlike nb1–nb6 which used the `lime` library (and required the sklearn mock injection workaround), this notebook implements LIME from scratch:
+
+```python
+class LIMEExplainer:
+    def __init__(self, model, text_encoder, num_perturbations=500,
+                 num_superpixels=50, device='cuda'):
+```
+
+**Grid-based superpixels:** Instead of using SLIC (Simple Linear Iterative Clustering) from scikit-image, this implementation divides the image into a regular grid of `n_h × n_w` rectangular cells. While less visually natural than SLIC superpixels (which follow image edges), grid superpixels are much faster to compute and sufficient for identifying broad spatial regions of importance.
+
+**Perturbation procedure:**
+1. For each of `num_perturbations=500` iterations: randomly mask each superpixel (set to zero) with 50% probability.
+2. Run the perturbed frame through the full model (only the last frame of the video clip is perturbed; the other 5 frames remain unchanged).
+3. Record the model's predicted score for the target action's most likely bin.
+4. Record the Euclidean distance between the perturbation mask and the "all-ones" mask (original image).
+
+**Local linear fit:**
+```python
+# LIME kernel: exponential decay weighting by distance from original
+kernel_width = 0.75 × sqrt(num_superpixels)
+weights = exp(-distances² / (2 × kernel_width²))
+
+# Weighted least squares: (XᵀWX + λI)β = XᵀWy
+XtWX = X.T @ diag(weights) @ X + 1e-6 × I
+coefficients = solve(XtWX, X.T @ diag(weights) @ y)
+```
+
+The `1e-6` regularisation constant prevents `XtWX` from being singular when superpixels are perfectly correlated (which can happen with grid-based segmentation). The coefficients map each superpixel to its estimated contribution to the model's prediction — positive = presence of this region increases the action score, negative = presence decreases it.
+
+**Why 500 perturbations (vs. 128 in nb1–nb6)?** More perturbations give a more accurate local linear approximation. 128 perturbations is sufficient for coarse visualisation but can produce noisy coefficient estimates for superpixels that are rarely masked. 500 perturbations provides enough statistical coverage for stable estimates, especially with 50 superpixels (meaning each superpixel is masked ~250 times on average).
+
+---
+
+## `SHAPExplainer` — DeepSHAP-Style Marginal Contribution Estimation
+
+```python
+class SHAPExplainer:
+    def __init__(self, model, text_encoder, n_background=20, device='cuda'):
+```
+
+This implements a DeepSHAP-style explainer that estimates Shapley values by sampling the marginal contribution of spatial segments relative to background images. Rather than computing exact Shapley values (which requires `2^N` forward passes for N features), it approximates them by:
+
+1. Sampling `n_background=20` background images from the validation set.
+2. For each foreground image and each background image, computing the difference in model output when the foreground segment is present vs. absent (replaced by the background segment).
+3. Averaging these differences over all background samples.
+
+This is a direct implementation of the Shapley value formula: `φ_i = E_S[f(S ∪ {i}) - f(S)]` approximated by sampling coalitions from the background distribution.
+
+---
+
+## Section 10: XAI Visualisation Engine — `XAIVisualizer`
+
+`XAIVisualizer` is a static utility class for rendering XAI outputs. Unlike the inline plotting in nb1–nb6 (where each block generates its own figures), this class centralises all visualisation into reusable static methods:
+
+- `plot_cam_comparison(video, instructions, cam_results, save_path)` — side-by-side panels for all CAM methods
+- `_get_frame_numpy(video_tensor, frame_idx=-1)` — extracts the last frame as a normalised `(H, W, 3)` NumPy array for overlay rendering
+- `CMAP_DIVERGING = 'RdBu_r'` — diverging colourmap for SHAP (red = positive, blue = negative)
+- `CMAP_SEQUENTIAL = 'inferno'` — sequential colourmap for attention maps
+- `CMAP_CAM = 'jet'` — standard jet colourmap for CAM overlays
+
+---
+
+## Section 11: Optimised Training Loop — `train_one_epoch()`
+
+The production training loop is encapsulated as a standalone function rather than an inline `for` loop in a notebook cell. This enables reuse from the training-resume script.
+
+**Key optimisation vs. nb1–nb6 training loop:**
+
+```python
+# ❌ nb1–nb6: metrics required a second forward pass
+# ✅ Production: reuse logits from the training forward pass
+with torch.no_grad():
+    preds = logits.argmax(dim=-1)      # shape: (B, 7)
+    correct = (preds == target_clean).sum().item()
+```
+
+In nb1–nb6, per-task accuracy metrics were computed by running a second `model.eval()` forward pass after each training step. This doubled the compute cost per batch. The production loop stores `target_clean = target.clone()` before MixUp modifies the targets, and reuses the training `logits` to compute accuracy from the same forward pass.
+
+**No `GradScaler` for BFloat16:**
+```python
+# nb1–nb6: scaler.scale(loss).backward()
+#           scaler.unscale_(optimizer)
+#           scaler.step(optimizer)
+#           scaler.update()
+
+# Production: directly backward, no scaler
+loss_scaled.backward()                      # no scaling
+torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+optimizer.step()
+```
+
+BFloat16 has the same dynamic range as Float32 (8 exponent bits vs. Float16's 5), so gradients cannot underflow to zero — the primary reason for loss scaling. Removing `GradScaler` eliminates 3 extra CUDA synchronisation points per optimiser step, slightly improving throughput.
+
+---
+
+## Section 12: Post-Training XAI Analysis — `run_xai_analysis()`
+
+This function orchestrates the entire XAI suite in order:
+
+```
+1/5 → CAM variants + novel hybrids (HiResCAM, ShapleyCAM, LayerCAM,
+                                      HiResShapleyCAM, MultiScaleLayerShapleyCAM)
+2/5 → LIME (500 perturbations per sample)
+3/5 → SHAP (20 background samples)
+4/5 → PDP & ICE (brightness, contrast, spatial shift, temporal shift)
+5/5 → Composite visualisation dashboard
+```
+
+For each of `XAI_NUM_SAMPLES=8` validation samples, all five CAM methods are computed and saved. The function then generates a master comparison figure with all methods side-by-side for each sample, saved to `xai_outputs/`.
+
+---
+
+## Section 13: Main Execution and Training Resume
+
+### `main()` Function
+
+The main function orchestrates the full pipeline: initialise text encoder → create datasets → create dataloaders → build model → set up Lion + CosineWarmupScheduler + FocalLoss + MixupCutMix + ModelEMA → run training loop → run XAI analysis.
+
+The model sanity check runs a dummy forward pass with shape `(2, 3, 6, 224, 224)` and asserts the output shape is `(2, 7, 256)` (batch=2, 7 action dimensions, 256 bins), confirming all tensor reshapes are correct before committing to a full training run.
+
+### Training Resume Cell
+
+The resume cell (Cell 28) is a production-essential feature. Long training runs on cloud or HPC environments frequently disconnect. The checkpoint saved by `CHECKPOINT_FREQ=5` provides recovery points every 5 epochs. The resume cell:
+
+1. Loads `rt1_production_best.pt` (the best checkpoint, which includes the full training state: model weights, optimizer state dict, EMA shadow weights, `ValidationTracker` history, and current epoch number).
+2. Restores the optimizer state and scheduler step count so training continues from exactly the point of interruption (same LR, same momentum buffers in Lion).
+3. The choice between `rt1_production_best.pt` (epoch 25, best val loss) and `rt1_checkpoint_epoch_20.pt` (epoch 20, periodic) is made by inspecting both files and comparing their recorded validation losses. The best checkpoint is always preferred because it contains more training progress and the full optimizer state.
+
+**Why save optimizer state?** Resuming from just the model weights would restart the Lion momentum buffers at zero and reset the scheduler to the warmup phase. This would cause a "cold start" where the first post-resume epoch behaves like the very beginning of training — potentially worsening the model's performance by overwriting carefully learned weight directions with large early-warmup updates.
+
+---
+
+## Summary: Key Differences Between Production Notebook and nb1–nb6
+
+| Aspect | nb1–nb6 (Cable Routing) | Production (DROID) |
+|---|---|---|
+| **Dataset** | `berkeley_cable_routing` via TFDS/GCS | `droid_train_100.npz` local NPZ |
+| **Dataset class** | `CableRoutingDataset` with memmap cache | `AdvancedDroidDataset` direct RAM load |
+| **Augmentation** | Fixed pipeline for all tasks | Adaptive strong/weak by task frequency |
+| **New augmentations** | None | `GaussianBlur`, `RandomErasing` |
+| **Batch config** | BS=1, accum=128 (effective=128) | BS=15, accum=2 (effective=30) |
+| **XAI library** | External `pytorch-grad-cam` | Fully custom built-in hooks |
+| **CAM methods** | GradCAM, HiResCAM, ShapleyCAM | HiResCAM, ShapleyCAM, LayerCAM |
+| **Novel XAI** | ShaGCAM, LimeCAM (post-hoc fusion) | HiResShapleyCAM, MultiScaleLayerShapleyCAM (architecturally integrated) |
+| **LIME** | Via `lime` library + sklearn mock | Custom grid-superpixel + closed-form WLS |
+| **Training fn** | Inline loop in notebook cell | Standalone `train_one_epoch()` function |
+| **Metrics** | Simple patience counter + history dict | `ValidationTracker` with trend analysis |
+| **EMA usage** | Save shadow weights only | Apply to model during validation |
+| **Checkpointing** | Best checkpoint only | Every 5 epochs + best |
+| **Resume** | Not supported | Dedicated resume cell |
+| **GradScaler** | Used (for correctness) | Removed (BFloat16 doesn't need it) |
