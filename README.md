@@ -2082,3 +2082,9 @@ The resume cell (Cell 28) is a production-essential feature. Long training runs 
 | **Checkpointing** | Best checkpoint only | Every 5 epochs + best |
 | **Resume** | Not supported | Dedicated resume cell |
 | **GradScaler** | Used (for correctness) | Removed (BFloat16 doesn't need it) |
+
+---
+
+## 👤 Author
+
+**Sparsh Agarwal** — [GitHub](https://github.com/sparsh0106) · [LinkedIn](https://www.linkedin.com/in/sparsh-agarwal-4b443b304/)
